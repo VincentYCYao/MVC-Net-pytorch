@@ -71,6 +71,7 @@ def loss_angle(x, y, theta=5):
     """
 
     # cReg loss
+    # TODO: check: should x be degree or radian
     log_cosh_err = x.sub(y).cosh().log()
     x_bar_log_cosh_err = log_cosh_err.cos().mean(1)
     y_bar_log_cosh_err = log_cosh_err.sin().mean(1)
@@ -486,7 +487,7 @@ class MVCNet(nn.Module):
         return out2_SLE_sag, out2_SLE_cor, out_CAE_sag, out_CAE_cor
 
     def fit_MVCNet(self, epochs, opt, lr_scheduler, train_dl, valid_dl, dev, wd, flag, ang_flag, theta,
-                   global_train_steps, writer, start_epoch=1, scheme='scheme1'):
+                   global_train_steps, writer, start_epoch=1, scheme='ILAT'):
         # training for each epoch
         for epoch in range(start_epoch, epochs + 1):
             # ====================================================================================================
@@ -504,64 +505,128 @@ class MVCNet(nn.Module):
                 i_trainSize, num_C, x_H, x_W = x_b.size()
                 accumulated_trainSize += i_trainSize
 
-                # we don't have two view, so we input the same-view image to two network entries
-                lm_sag_cuda, lm_cor_cuda, ang_sag_cuda, ang_cor_cuda = self.forward(x_b.to(dev), x_b.to(dev))
-
-                # concatenate landmarks predictions or ground truths from 2 views
-                lm_cat_cuda = torch.cat((lm_sag_cuda, lm_cor_cuda), 1)
-                y_lm_cat_cuda = y_lm_b.repeat(1, 2).to(dev)
-
-                # TODO: try different landmark loss
-                # theta=5 in original paper, we can use theta=0.2 to cater regression loss
-                lm_loss_train = loss_landmark(lm_cat_cuda, y_lm_cat_cuda, theta)
-                epoch_lm_loss_train += lm_loss_train.item() * i_trainSize  # the last batch has less data
-
-                # concatenate cobb angle predictions or ground truths from 2 views
-                ang_cat_cuda = torch.cat((ang_sag_cuda, ang_cor_cuda), 1)
-                y_ang_cat_cuda = y_ang_b.repeat(1, 2).to(dev)
-
-                # TODO: try different ang_loss
-                assert ang_flag == 'circular' or 'non-circular' or 'circular_absCMAE'
-                if ang_flag == 'circular':
-                    ang_loss_train = loss_angle(ang_cat_cuda, y_ang_cat_cuda, theta)
-                if ang_flag == 'circular_absCMAE':
-                    ang_loss_train = loss_angle_absCMAE(ang_cat_cuda, y_ang_cat_cuda, theta)
-                if ang_flag == 'non-circular':
-                    ang_loss_train = loss_angle_nonCircular(ang_cat_cuda, y_ang_cat_cuda, theta)
-                epoch_ang_loss_train += ang_loss_train.item() * i_trainSize
-
                 # train network with different schemes
-                assert scheme == "scheme1" or "scheme2"
-                if scheme == "scheme1":
+                assert scheme == "ILAT" or "Sequential"
+                if scheme == "ILAT":
                     # The training scheme described in original paper
-                    # back-prop two losses one after another
-                    if global_train_steps % 2 == 1:
-                        lm_loss_train.backward()
-                        plot_CAE_flag = False
-                        print('back-prop using landmark loss')
-                    else:
-                        ang_loss_train.backward()
-                        plot_CAE_flag = True
-                        print('back-prop using angle loss')
-                if scheme == "scheme2":
-                    # try this training scheme (proposed by YC Yao)
-                    if epoch <= 100:  # use lm_loss for back-prop in the first 100 epochs
+                    # back-prop two losses one after another within the same batch
+
+                    # [1] one-step back-propagation using lm_loss -------------------------------------------------- [1]
+                    # we don't have two view, so we input the same-view image to two network entries
+                    lm_sag_cuda, lm_cor_cuda, ang_sag_cuda, ang_cor_cuda = self.forward(x_b.to(dev), x_b.to(dev))
+
+                    # concatenate landmarks predictions or ground truths from 2 views
+                    lm_cat_cuda = torch.cat((lm_sag_cuda, lm_cor_cuda), 1)
+                    y_lm_cat_cuda = y_lm_b.repeat(1, 2).to(dev)
+
+                    # TODO: try different landmark loss
+                    # theta=5 in original paper, we can use theta=0.2 to cater regression loss
+                    lm_loss_train = loss_landmark(lm_cat_cuda, y_lm_cat_cuda, theta)
+                    epoch_lm_loss_train += lm_loss_train.item() * i_trainSize  # the last batch has less data
+
+                    # concatenate cobb angle predictions or ground truths from 2 views
+                    ang_cat_cuda = torch.cat((ang_sag_cuda, ang_cor_cuda), 1)
+                    y_ang_cat_cuda = y_ang_b.repeat(1, 2).to(dev)
+
+                    # TODO: try different ang_loss
+                    assert ang_flag == 'circular' or 'non-circular' or 'circular_absCMAE'
+                    if ang_flag == 'circular':
+                        ang_loss_train = loss_angle(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    if ang_flag == 'circular_absCMAE':
+                        ang_loss_train = loss_angle_absCMAE(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    if ang_flag == 'non-circular':
+                        ang_loss_train = loss_angle_nonCircular(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    epoch_ang_loss_train += ang_loss_train.item() * i_trainSize
+
+                    # back-propagation
+                    print('back-prop using landmark loss')
+                    lm_loss_train.backward()
+                    opt.step()
+                    opt.zero_grad()
+                    plot_CAE_flag = False
+                    plot_MVCNet_grad(self, writer, global_train_steps, plot_CAE_flag)
+                    # [1] end -------------------------------------------------------------------------------------- [1]
+
+                    # [2] one-step back-propagation using ang_loss ------------------------------------------------- [2]
+                    # we don't have two view, so we input the same-view image to two network entries
+                    lm_sag_cuda, lm_cor_cuda, ang_sag_cuda, ang_cor_cuda = self.forward(x_b.to(dev), x_b.to(dev))
+
+                    # concatenate landmarks predictions or ground truths from 2 views
+                    lm_cat_cuda = torch.cat((lm_sag_cuda, lm_cor_cuda), 1)
+                    y_lm_cat_cuda = y_lm_b.repeat(1, 2).to(dev)
+
+                    # TODO: try different landmark loss
+                    # theta=5 in original paper, we can use theta=0.2 to cater regression loss
+                    lm_loss_train = loss_landmark(lm_cat_cuda, y_lm_cat_cuda, theta)
+                    epoch_lm_loss_train += lm_loss_train.item() * i_trainSize  # the last batch has less data
+
+                    # concatenate cobb angle predictions or ground truths from 2 views
+                    ang_cat_cuda = torch.cat((ang_sag_cuda, ang_cor_cuda), 1)
+                    y_ang_cat_cuda = y_ang_b.repeat(1, 2).to(dev)
+
+                    # TODO: try different ang_loss
+                    assert ang_flag == 'circular' or 'non-circular' or 'circular_absCMAE'
+                    if ang_flag == 'circular':
+                        ang_loss_train = loss_angle(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    if ang_flag == 'circular_absCMAE':
+                        ang_loss_train = loss_angle_absCMAE(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    if ang_flag == 'non-circular':
+                        ang_loss_train = loss_angle_nonCircular(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    epoch_ang_loss_train += ang_loss_train.item() * i_trainSize
+
+                    # back-propagation
+                    print('back-prop using angle loss')
+                    ang_loss_train.backward()
+                    opt.step()
+                    opt.zero_grad()
+                    plot_CAE_flag = True
+                    plot_MVCNet_grad(self, writer, global_train_steps, plot_CAE_flag)
+                    # [2] end -------------------------------------------------------------------------------------- [2]
+
+                if scheme == "Sequential":
+                    # we don't have two view, so we input the same-view image to two network entries
+                    lm_sag_cuda, lm_cor_cuda, ang_sag_cuda, ang_cor_cuda = self.forward(x_b.to(dev), x_b.to(dev))
+
+                    # concatenate landmarks predictions or ground truths from 2 views
+                    lm_cat_cuda = torch.cat((lm_sag_cuda, lm_cor_cuda), 1)
+                    y_lm_cat_cuda = y_lm_b.repeat(1, 2).to(dev)
+
+                    # TODO: try different landmark loss
+                    # theta=5 in original paper, we can use theta=0.2 to cater regression loss
+                    lm_loss_train = loss_landmark(lm_cat_cuda, y_lm_cat_cuda, theta)
+                    epoch_lm_loss_train += lm_loss_train.item() * i_trainSize  # the last batch has less data
+
+                    # concatenate cobb angle predictions or ground truths from 2 views
+                    ang_cat_cuda = torch.cat((ang_sag_cuda, ang_cor_cuda), 1)
+                    y_ang_cat_cuda = y_ang_b.repeat(1, 2).to(dev)
+
+                    # TODO: try different ang_loss
+                    assert ang_flag == 'circular' or 'non-circular' or 'circular_absCMAE'
+                    if ang_flag == 'circular':
+                        ang_loss_train = loss_angle(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    if ang_flag == 'circular_absCMAE':
+                        ang_loss_train = loss_angle_absCMAE(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    if ang_flag == 'non-circular':
+                        ang_loss_train = loss_angle_nonCircular(ang_cat_cuda, y_ang_cat_cuda, theta)
+                    epoch_ang_loss_train += ang_loss_train.item() * i_trainSize
+
+                    # Training Scheme: Sequential
+                    if epoch <= 1000:  # use lm_loss for back-prop in the first 100 epochs
                         print('back-prop using landmark loss')
                         lm_loss_train.backward()
                         plot_CAE_flag = False
                     elif global_train_steps % 2 == 1:
+                        print('back-prop using landmark loss')
                         lm_loss_train.backward()
                         plot_CAE_flag = False
-                        print('back-prop using landmark loss')
                     else:
+                        print('back-prop using angle loss')
                         ang_loss_train.backward()
                         plot_CAE_flag = True
-                        print('back-prop using angle loss')
-
-                # one-step back-propagation
-                opt.step()
-                plot_MVCNet_grad(self, writer, global_train_steps, plot_CAE_flag)
-                opt.zero_grad()
+                    # one-step back-propagation using either lm_loss or ang_loss
+                    opt.step()
+                    plot_MVCNet_grad(self, writer, global_train_steps, plot_CAE_flag)
+                    opt.zero_grad()
 
                 print('epoch/batch: ', epoch, '/', i_batch, ' train lm_loss: ', lm_loss_train.detach().cpu().numpy(),
                       ' train ang_loss: ', ang_loss_train.detach().cpu().numpy())
