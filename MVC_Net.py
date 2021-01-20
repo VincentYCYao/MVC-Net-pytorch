@@ -610,12 +610,8 @@ class MVCNet(nn.Module):
                         ang_loss_train = loss_angle_nonCircular(ang_cat_cuda, y_ang_cat_cuda, theta)
                     epoch_ang_loss_train += ang_loss_train.item() * i_trainSize
 
-                    # Training Scheme: Sequential
-                    if epoch <= 1000:  # use lm_loss for back-prop in the first 100 epochs
-                        print('back-prop using landmark loss')
-                        lm_loss_train.backward()
-                        plot_CAE_flag = False
-                    elif global_train_steps % 2 == 1:
+                    # Training Scheme: Sequential (simple version)
+                    if epoch <= 1000:  # use lm_loss for back-prop in the first 1000 epochs
                         print('back-prop using landmark loss')
                         lm_loss_train.backward()
                         plot_CAE_flag = False
